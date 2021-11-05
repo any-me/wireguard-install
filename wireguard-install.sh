@@ -246,7 +246,7 @@ PrivateKey = $key
 PublicKey = $(grep PrivateKey /etc/wireguard/wg0.conf | cut -d " " -f 3 | wg pubkey)
 PresharedKey = $psk
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = $(grep '^# ENDPOINT' /etc/wireguard/wg0.conf | cut -d " " -f 3):$(grep ListenPort /etc/wireguard/wg0.conf | cut -d " " -f 3)
+Endpoint = $(grep '^# ENDPOINT' /etc/wireguard/wg0.conf | cut -d " " -f 3):$(grep '^# PORT' /etc/wireguard/wg0.conf | cut -d " " -f 3)
 PersistentKeepalive = 25
 EOF
 }
@@ -261,6 +261,7 @@ if [[ ! -e /etc/wireguard/wg0.conf ]]; then
 	fi
 	clear
 	echo 'Welcome to this WireGuard road warrior installer!'
+	read -p "Input domain (empty for ip): " domain_name
 	# If system has a single IPv4, it is selected automatically. Else, ask the user
 	if [[ $(ip -4 addr | grep inet | grep -vEc '127(\.[0-9]{1,3}){3}') -eq 1 ]]; then
 		ip=$(ip -4 addr | grep inet | grep -vE '127(\.[0-9]{1,3}){3}' | cut -d '/' -f 1 | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}')
@@ -316,6 +317,9 @@ if [[ ! -e /etc/wireguard/wg0.conf ]]; then
 		echo "$port: invalid port."
 		read -p "Port [51820]: " port
 	done
+	if [[ "$port" == "53" ]]; then 
+		port="51820" && dns_port_forward="53"
+	fi
 	[[ -z "$port" ]] && port="51820"
 	echo
 	echo "Enter a name for the first client:"
@@ -459,7 +463,8 @@ Environment=WG_SUDO=1" > /etc/systemd/system/wg-quick@wg0.service.d/boringtun.co
 	cat << EOF > /etc/wireguard/wg0.conf
 # Do not alter the commented lines
 # They are used by wireguard-install
-# ENDPOINT $([[ -n "$public_ip" ]] && echo "$public_ip" || echo "$ip")
+# ENDPOINT $([[ -n "$domain_name" ]] && echo "$domain_name" ||[[ -n "$public_ip" ]] && echo "$public_ip" || echo "$ip")
+# PORT $([[ -n "$dns_port_forward" ]] && echo "$dns_port_forward" || echo "$port")
 
 [Interface]
 Address = 10.7.0.1/24$([[ -n "$ip6" ]] && echo ", fddd:2c4:2c4:2c4::1/64")
@@ -485,6 +490,10 @@ EOF
 		firewall-cmd --zone=trusted --add-source=10.7.0.0/24
 		firewall-cmd --permanent --add-port="$port"/udp
 		firewall-cmd --permanent --zone=trusted --add-source=10.7.0.0/24
+		if [[ -n "$dns_port_forward" ]]; then
+			firewall-cmd  --add-forward-port=port="$dns_port_forward":proto=udp:toport="$port"
+			firewall-cmd  --permanent --add-forward-port=port="$dns_port_forward":proto=udp:toport="$port"
+		fi
 		# Set NAT for the VPN subnet
 		firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to "$ip"
 		firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to "$ip"
@@ -523,6 +532,10 @@ ExecStart=$ip6tables_path -I FORWARD -m state --state RELATED,ESTABLISHED -j ACC
 ExecStop=$ip6tables_path -t nat -D POSTROUTING -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to $ip6
 ExecStop=$ip6tables_path -D FORWARD -s fddd:2c4:2c4:2c4::/64 -j ACCEPT
 ExecStop=$ip6tables_path -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" >> /etc/systemd/system/wg-iptables.service
+		fi
+		if [[ -n $dns_port_forward ]]; then
+			echo "ExecStart=$iptables_path -t nat -A PREROUTING --in-interface eth0 -p udp --dport $dns_port_forward -j REDIRECT --to-ports $port
+ExecStop=$iptables_path -t nat -D PREROUTING --in-interface eth0 -p udp --dport $dns_port_forward -j REDIRECT --to-ports $port" >> /etc/systemd/system/wg-iptables.service
 		fi
 		echo "RemainAfterExit=yes
 [Install]
@@ -679,6 +692,11 @@ else
 					# Using both permanent and not permanent rules to avoid a firewalld reload.
 					firewall-cmd --remove-port="$port"/udp
 					firewall-cmd --zone=trusted --remove-source=10.7.0.0/24
+					# if [[ -n $dns_port_forward ]]; then
+						dns_port_forward="53"
+						firewall-cmd  --remove-forward-port=port="$dns_port_forward":proto=udp:toport="$port"	
+						firewall-cmd  --permanent --remove-forward-port=port="$dns_port_forward":proto=udp:toport="$port"
+					# fi
 					firewall-cmd --permanent --remove-port="$port"/udp
 					firewall-cmd --permanent --zone=trusted --remove-source=10.7.0.0/24
 					firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to "$ip"
@@ -690,6 +708,7 @@ else
 						firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to "$ip6"
 						firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to "$ip6"
 					fi
+					
 				else
 					systemctl disable --now wg-iptables.service
 					rm -f /etc/systemd/system/wg-iptables.service
